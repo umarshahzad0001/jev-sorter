@@ -29,6 +29,14 @@ from pathlib import Path
 API_URL = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-latest"
 KEY_ENV = "JEV_API_KEY"
+PRICE_PER_M_INPUT = 0.042  # USD; output tokens are free
+
+
+def summarize_usage(usage_sink: list) -> tuple[int, int, float]:
+    """(input_tokens, output_tokens, cost_usd) totaled across a run's requests."""
+    in_tok = sum(u.get("input_tokens", 0) for u in usage_sink)
+    out_tok = sum(u.get("output_tokens", 0) for u in usage_sink)
+    return in_tok, out_tok, in_tok * PRICE_PER_M_INPUT / 1_000_000
 
 # Choice caps at 255 options; state + longest question caps at 32k tokens.
 MAX_OPTIONS = 255
@@ -241,7 +249,8 @@ def api_key() -> str:
     return key
 
 
-def jev_choice(state: dict, criteria: dict, key: str, timeout: int = 60) -> dict:
+def jev_choice(state: dict, criteria: dict, key: str, timeout: int = 60,
+              usage_sink: list | None = None) -> dict:
     payload = {
         "state": state,
         "model": MODEL,
@@ -274,6 +283,8 @@ def jev_choice(state: dict, criteria: dict, key: str, timeout: int = 60) -> dict
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+            if usage_sink is not None:
+                usage_sink.append(data.get("usage", {}))  # list.append is thread-safe
             return data["answers"]["folder"]
         except urllib.error.HTTPError as exc:
             if exc.code == 401:
@@ -362,10 +373,13 @@ def decide_target(dec: Decision, current: str | None, args) -> str | None:
 
 
 def sort_folder(folder: Path, args, key: str, run_id: str,
-                classify=None, already_moved: set | None = None) -> tuple[int, int]:
+                classify=None, already_moved: set | None = None,
+                usage_sink: list | None = None) -> tuple[int, int]:
     """Sort one folder's loose files (and, with --resort, its filed files)."""
     already_moved = already_moved if already_moved is not None else set()
-    classify = classify or (lambda state, criteria: jev_choice(state, criteria, key))
+    classify = classify or (
+        lambda state, criteria: jev_choice(state, criteria, key, usage_sink=usage_sink)
+    )
 
     config = load_config(folder)
     subs = subfolders(folder)
@@ -511,6 +525,7 @@ def cmd_sort(args) -> int:
         run_id = uuid.uuid4().hex[:12]
         already_moved: set = set()
         total_moved = total_seen = 0
+        usage_sink: list = []
 
         jobs: list[Path] = []
         for root in roots:
@@ -522,7 +537,7 @@ def cmd_sort(args) -> int:
 
         for folder in jobs:
             m, s = sort_folder(folder, args, key, run_id,
-                               already_moved=already_moved)
+                               already_moved=already_moved, usage_sink=usage_sink)
             total_moved += m
             total_seen += s
 
@@ -532,6 +547,11 @@ def cmd_sort(args) -> int:
             print("Re-run with --apply to actually move them.")
         if args.apply and total_moved:
             print(f"Undo with:  jevsorter undo {run_id}")
+
+        if usage_sink:
+            in_tok, out_tok, cost = summarize_usage(usage_sink)
+            print(f"Jev usage: {in_tok:,} input + {out_tok:,} output tokens "
+                  f"across {len(usage_sink)} requests  (~${cost:.4f})")
 
         if not args.every:
             return 0
@@ -700,6 +720,13 @@ def cmd_selftest(args) -> int:
             raise AssertionError("--recursive --resort should be refused")
         except SystemExit as exc:
             assert "judged twice" in str(exc), exc
+
+        # --- usage totals math, without a network call ---------------------
+        fake = [{"input_tokens": 1200, "output_tokens": 30},
+                {"input_tokens": 800, "output_tokens": 20}]
+        in_tok, out_tok, cost = summarize_usage(fake)
+        assert (in_tok, out_tok) == (2000, 50)
+        assert abs(cost - 2000 * 0.042 / 1_000_000) < 1e-12
 
         # --- bare 'sort' / 'propose' mean the current directory -----------
         # This one guards a destructive default: if it ever regressed to
