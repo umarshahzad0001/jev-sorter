@@ -1,0 +1,2 @@
+[console_scripts]
+jevsorter = jevsorter:main

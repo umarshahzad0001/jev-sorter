@@ -1,0 +1,8 @@
+README.md
+jevsorter.py
+pyproject.toml
+jevsorter.egg-info/PKG-INFO
+jevsorter.egg-info/SOURCES.txt
+jevsorter.egg-info/dependency_links.txt
+jevsorter.egg-info/entry_points.txt
+jevsorter.egg-info/top_level.txt

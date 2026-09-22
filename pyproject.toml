@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jevsorter"
+version = "0.1.0"
+description = "Sort loose files into a folder's own subfolders, using Jev to judge where each one belongs."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["files", "sorting", "jev", "typesafe", "cli"]
+
+[project.scripts]
+jevsorter = "jevsorter:main"
+
+[tool.setuptools]
+py-modules = ["jevsorter"]

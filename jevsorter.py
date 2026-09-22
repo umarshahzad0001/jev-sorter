@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-filesort.py - sort loose files into a folder's own subfolders, using Jev
+jevsorter - sort loose files into a folder's own subfolders, using Jev
 (TypeSafe System One) to judge which subfolder each file belongs in.
 
 Dry run by default. Nothing moves without --apply.
 
-    python filesort.py propose DIR              list filenames, draft categories
-    python filesort.py sort DIR [DIR ...]       DRY RUN unless --apply
-    python filesort.py undo [last | <run-id>]   reverse a run
-    python filesort.py selftest                 built-in assertions, no network
+    jevsorter propose DIR              list filenames, draft categories
+    jevsorter sort DIR [DIR ...]       DRY RUN unless --apply
+    jevsorter undo [last | <run-id>]   reverse a run
+    jevsorter selftest                 built-in assertions, no network
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ CRITERIA_CHAR_BUDGET = 24_000
 EXAMPLES_PER_FOLDER = 5
 WORKERS = 8  # rate limit is 1200 req/min, so this is nowhere near it
 
-CONFIG_NAME = ".filesort.json"
+CONFIG_NAME = ".jevsorter.json"
 STAY = "__stay__"
 STAY_DESC = (
     "The file does not clearly belong in any of the other listed folders, "
@@ -69,8 +69,11 @@ SKIP_NAMES = {"desktop.ini", "thumbs.db", ".ds_store", CONFIG_NAME.lower()}
 # --------------------------------------------------------------------------
 
 def log_path() -> Path:
+    override = os.environ.get("JEVSORTER_LOG")
+    if override:
+        return Path(override)
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    return Path(base) / "filesort" / "moves.jsonl"
+    return Path(base) / "jevsorter" / "moves.jsonl"
 
 
 def append_log(record: dict) -> None:
@@ -182,7 +185,7 @@ def load_config(folder: Path) -> dict[str, str] | None:
 
 def build_criteria(folder: Path, config: dict[str, str] | None) -> dict:
     """
-    Criteria for one folder. From .filesort.json if present, else from the
+    Criteria for one folder. From .jevsorter.json if present, else from the
     folder's existing subfolders described by what already lives in them.
     """
     if config is not None:
@@ -482,6 +485,21 @@ def cmd_sort(args) -> int:
             raise SystemExit(f"{p} is not a folder")
         roots.append(p)
 
+    # Both at once judges the same file twice: once as a resort candidate of the
+    # parent (current_folder set, --margin applies) and once as a loose file of
+    # the subfolder's own job (current_folder None, so --margin does not). The
+    # second pass could move it on threshold alone. They do one level of the same
+    # work anyway, so run them separately.
+    if args.recursive and args.resort:
+        raise SystemExit(
+            "--recursive and --resort cannot be combined: a file inside a "
+            "subfolder would be judged twice, and the second pass loses the "
+            "--margin protection that keeps already-filed files put.\n"
+            "Run them as two passes instead:\n"
+            "    jevsorter sort DIR --resort      (re-file one level down)\n"
+            "    jevsorter sort DIR --recursive   (sort each folder's own files)"
+        )
+
     key = api_key()
 
     while True:
@@ -508,7 +526,7 @@ def cmd_sort(args) -> int:
         if not args.apply and total_moved:
             print("Re-run with --apply to actually move them.")
         if args.apply and total_moved:
-            print(f"Undo with:  python filesort.py undo {run_id}")
+            print(f"Undo with:  jevsorter undo {run_id}")
 
         if not args.every:
             return 0
@@ -559,6 +577,10 @@ def cmd_selftest(args) -> int:
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
+        # keep the real move log clean
+        os.environ["JEVSORTER_LOG"] = str(root / "moves.jsonl")
+
+        old = time.time() - 9999
 
         # --- unique_dest never clobbers -----------------------------------
         (root / "a.txt").write_text("x")
@@ -566,9 +588,10 @@ def cmd_selftest(args) -> int:
         (root / "a (1).txt").write_text("x")
         assert unique_dest(root / "a.txt").name == "a (2).txt"
         assert unique_dest(root / "nope.txt").name == "nope.txt"
+        for n in ("a.txt", "a (1).txt"):
+            os.utime(root / n, (old, old))
 
         # --- file skip rules ----------------------------------------------
-        old = time.time() - 9999
         for name in ["real.pdf", "half.crdownload", "~$lock.xlsx",
                      "desktop.ini", "short.lnk", "fresh.pdf"]:
             p = root / name
@@ -617,7 +640,7 @@ def cmd_selftest(args) -> int:
         assert crit["Invoices"]["files_already_in_it"] == ["inv_001.pdf"]
         assert STAY in crit and len(crit) == 3
 
-        # --- .filesort.json overrides the folder listing -------------------
+        # --- .jevsorter.json overrides the folder listing -------------------
         (work / CONFIG_NAME).write_text(json.dumps(
             {"categories": {"Invoices": "bills", "Contracts": "signed docs"}}))
         crit = build_criteria(work, load_config(work))
@@ -659,6 +682,15 @@ def cmd_selftest(args) -> int:
         assert not (box / "Reports" / "q3_report.pdf").exists()
         assert (box / "Reports" / "keep.txt").exists(), "undo touched a bystander"
 
+        # --- --recursive + --resort is refused (it double-judges files) ----
+        try:
+            cmd_sort(SimpleNamespace(dirs=[str(box)], recursive=True, resort=True,
+                                     apply=False, max_depth=3, every=0, min_age=30,
+                                     min_confidence=0.6, margin=0.15))
+            raise AssertionError("--recursive --resort should be refused")
+        except SystemExit as exc:
+            assert "judged twice" in str(exc), exc
+
     print("selftest OK")
     return 0
 
@@ -667,7 +699,7 @@ def cmd_selftest(args) -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        prog="filesort.py",
+        prog="jevsorter",
         description="Sort loose files into a folder's own subfolders using Jev.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -701,12 +733,14 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_selftest)
 
     args = ap.parse_args(argv)
-    return args.func(args)
+    # Ctrl+C is handled here, not under __main__, so the installed console
+    # script behaves the same as running the file directly.
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("\ninterrupted")
+        return 130
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        print("\ninterrupted")
-        sys.exit(130)
+    sys.exit(main())
