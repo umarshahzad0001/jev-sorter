@@ -691,24 +691,35 @@ def cmd_selftest(args) -> int:
         except SystemExit as exc:
             assert "judged twice" in str(exc), exc
 
+        # --- bare 'sort' / 'propose' mean the current directory -----------
+        # This one guards a destructive default: if it ever regressed to
+        # something other than cwd, --apply would move the wrong files.
+        parser = build_parser()
+        assert parser.parse_args(["sort"]).dirs == ["."]
+        assert parser.parse_args(["sort", "X", "Y"]).dirs == ["X", "Y"]
+        assert parser.parse_args(["propose"]).dir == "."
+        assert parser.parse_args(["propose", "X"]).dir == "X"
+
     print("selftest OK")
     return 0
 
 
 # --------------------------------------------------------------------------
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="jevsorter",
         description="Sort loose files into a folder's own subfolders using Jev.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("propose", help="list filenames so categories can be drafted")
-    p.add_argument("dir")
+    p.add_argument("dir", nargs="?", default=".",
+                   help="folder to inspect (default: the current directory)")
     p.set_defaults(func=cmd_propose)
 
     p = sub.add_parser("sort", help="sort folders (dry run unless --apply)")
-    p.add_argument("dirs", nargs="+", metavar="DIR")
+    p.add_argument("dirs", nargs="*", default=["."], metavar="DIR",
+                   help="folders to sort (default: the current directory)")
     p.add_argument("--apply", action="store_true",
                    help="actually move files; without this nothing moves")
     p.add_argument("--recursive", action="store_true",
@@ -731,8 +742,11 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("selftest", help="run built-in assertions")
     p.set_defaults(func=cmd_selftest)
+    return ap
 
-    args = ap.parse_args(argv)
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
     # Ctrl+C is handled here, not under __main__, so the installed console
     # script behaves the same as running the file directly.
     try:
