@@ -4,30 +4,71 @@ Sorts loose files into a folder's own subfolders. Jev (TypeSafe System One) judg
 which subfolder each file belongs in; the script owns every decision about what
 actually moves.
 
-Pure stdlib, so it pulls in no dependencies.
+Pure stdlib, so it pulls in no dependencies of its own.
+
+## Prerequisites
+
+- **Python 3.9 or later**, with `pip`.
+- **[pipx](https://pipx.pypa.io/)** to install it as an isolated CLI tool, the same
+  way you'd install any other command-line program. If you don't have it yet, the
+  install commands below cover that too.
+- **A Jev API key**, set as the `JEV_API_KEY` environment variable. Get one at
+  [typesafe.ai](https://typesafe.ai) — the key is never stored in a file or printed
+  by this tool, only read from the environment.
 
 ## Install
 
-```bash
-uv tool install .
+Run from inside this project folder (the one with `pyproject.toml`).
+
+### Windows (PowerShell)
+
+```powershell
+py -m pip install --user pipx
+py -m pipx ensurepath
+# open a new terminal so the updated PATH takes effect, then:
+pipx install .
 ```
 
-That puts a real `jevsorter` executable on your PATH, so it runs from any directory
-in any shell. `pipx install .` works the same way if you'd rather use that.
-
-Edited the code? Reinstall with `uv tool install . --force`, or install once with
-`--editable` and skip the step from then on. To remove it: `uv tool uninstall jevsorter`.
-
-You'll also need `JEV_API_KEY` set as a user environment variable:
+### macOS
 
 ```bash
+brew install pipx    # or: python3 -m pip install --user pipx
+pipx ensurepath
+# open a new terminal, then:
+pipx install .
+```
+
+### Linux
+
+```bash
+sudo apt install pipx    # Debian/Ubuntu — or use your distro's package manager
+pipx ensurepath
+# open a new terminal, then:
+pipx install .
+```
+
+All three put a `jevsorter` command on your PATH, in its own isolated environment,
+runnable from any directory. To pick up code changes: `pipx install . --force`.
+To remove it: `pipx uninstall jevsorter`.
+
+### Set the API key
+
+**Windows (PowerShell)** — persists across terminals:
+```powershell
 setx JEV_API_KEY "your-key-here"
+```
+
+**macOS / Linux** — add to your shell profile (`~/.zshrc`, `~/.bashrc`, or similar)
+so it persists:
+```bash
+echo 'export JEV_API_KEY="your-key-here"' >> ~/.zshrc
+source ~/.zshrc
 ```
 
 ## Quick start
 
 ```bash
-cd D:\Downloads
+cd ~/Downloads
 jevsorter propose    # list filenames so you can write categories
 jevsorter sort       # DRY RUN - prints decisions, moves nothing
 jevsorter sort --apply
@@ -38,8 +79,8 @@ jevsorter undo last
 explicitly when you want others, and `sort` takes as many as you like:
 
 ```bash
-jevsorter sort D:\Downloads D:\Documents D:\Study
-jevsorter selftest   # assertions, no network, no files touched
+jevsorter sort ~/Downloads ~/Documents ~/Study
+jevsorter selftest    # assertions, no network, no files touched
 ```
 
 ## How it decides
@@ -95,12 +136,13 @@ staying put that shouldn't, write better descriptions before you touch the thres
 ### `--recursive` sorts each folder into its own subfolders
 
 It doesn't build one flat list of every folder in the tree, and it can't: Choice caps
-at 255 options, and `D:\Development` alone holds 41,649 directories. Each folder is
-its own independent job, so files never jump between branches.
+at 255 options, and one real project folder on this machine holds over 40,000
+directories. Each folder is its own independent job, so files never jump between
+branches.
 
 It never descends into `node_modules`, `.git`, `.gradle`, `.kotlin`, `venv`,
-`__pycache__`, `site-packages`, `.next`, `.terraform`, `.tox`, `$RECYCLE.BIN`, or
-any dot-folder.
+`__pycache__`, `site-packages`, `.next`, `.terraform`, `.tox`, `$RECYCLE.BIN`,
+`System Volume Information`, or any dot-folder.
 
 The folder list is taken before anything moves, so a category folder created during
 this run isn't itself sorted until the next one. Run it twice if you care.
@@ -126,14 +168,18 @@ Dry-run it first. Always.
 - **In-flight downloads are skipped** (`.crdownload`, `.part`, `.partial`, `.tmp`,
   `.download`, `.opdownload`, `.aria2`), along with anything modified in the last
   `--min-age` seconds. That's a code rule, never a question put to the model.
-- **Also skipped:** Office lock files (`~$*`), `desktop.ini`, `thumbs.db`, and
-  `.lnk` / `.url` shortcuts, which break when you move them.
+- **Also skipped:** Office lock files (`~$*`), `desktop.ini`, `thumbs.db`, and, on
+  Windows, `.lnk` / `.url` shortcuts, which break when you move them.
 - **A folder with more than 255 categories is refused**, not quietly shortlisted.
   Shortlisting would hide the real reason files stayed put.
 - **Files in use** get logged and skipped rather than crashing the run.
-- **Every move is logged** to `%LOCALAPPDATA%\jevsorter\moves.jsonl` with the choice,
-  confidence and top probabilities. `undo last` (or `undo <run-id>`) replays a run
-  backwards, and only restores a file if its original path is still free.
+- **Every move is logged**, one run per undo:
+  - Windows: `%LOCALAPPDATA%\jevsorter\moves.jsonl`
+  - macOS / Linux: `~/jevsorter/moves.jsonl`
+
+  Each line records the choice, confidence and top probabilities. `undo last` (or
+  `undo <run-id>`) replays a run backwards, and only restores a file if its original
+  path is still free.
 - **The API key comes from `JEV_API_KEY` and nowhere else.** It's never stored in a
   config file and never printed.
 

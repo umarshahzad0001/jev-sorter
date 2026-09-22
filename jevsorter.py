@@ -241,7 +241,8 @@ def api_key() -> str:
     return key
 
 
-def jev_choice(state: dict, criteria: dict, key: str, timeout: int = 60) -> dict:
+def jev_choice(state: dict, criteria: dict, key: str, timeout: int = 60,
+              usage_sink: list | None = None) -> dict:
     payload = {
         "state": state,
         "model": MODEL,
@@ -274,6 +275,8 @@ def jev_choice(state: dict, criteria: dict, key: str, timeout: int = 60) -> dict
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+            if usage_sink is not None:
+                usage_sink.append(data.get("usage", {}))  # list.append is thread-safe
             return data["answers"]["folder"]
         except urllib.error.HTTPError as exc:
             if exc.code == 401:
@@ -362,10 +365,13 @@ def decide_target(dec: Decision, current: str | None, args) -> str | None:
 
 
 def sort_folder(folder: Path, args, key: str, run_id: str,
-                classify=None, already_moved: set | None = None) -> tuple[int, int]:
+                classify=None, already_moved: set | None = None,
+                usage_sink: list | None = None) -> tuple[int, int]:
     """Sort one folder's loose files (and, with --resort, its filed files)."""
     already_moved = already_moved if already_moved is not None else set()
-    classify = classify or (lambda state, criteria: jev_choice(state, criteria, key))
+    classify = classify or (
+        lambda state, criteria: jev_choice(state, criteria, key, usage_sink=usage_sink)
+    )
 
     config = load_config(folder)
     subs = subfolders(folder)
