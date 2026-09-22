@@ -193,20 +193,25 @@ def build_criteria(folder: Path, config: dict[str, str] | None) -> dict:
     else:
         criteria = {}
         for sub in subfolders(folder):
-            examples = []
+            # A category folder can hold only subfolders. Saying it is "empty"
+            # in that case tells the model something false and loses the best
+            # evidence it has, so describe it by what it does contain.
+            examples, nested = [], []
             try:
                 for child in sorted(sub.iterdir()):
-                    if child.is_file():
+                    if child.is_file() and len(examples) < EXAMPLES_PER_FOLDER:
                         examples.append(child.name)
-                    if len(examples) >= EXAMPLES_PER_FOLDER:
-                        break
+                    elif child.is_dir() and len(nested) < EXAMPLES_PER_FOLDER:
+                        nested.append(child.name)
             except OSError:
                 pass
-            if examples:
-                criteria[sub.name] = {
-                    "folder": sub.name,
-                    "files_already_in_it": examples,
-                }
+            if examples or nested:
+                desc = {"folder": sub.name}
+                if examples:
+                    desc["files_already_in_it"] = examples
+                if nested:
+                    desc["subfolders_it_contains"] = nested
+                criteria[sub.name] = desc
             else:
                 criteria[sub.name] = f"The folder named {sub.name!r} (currently empty)."
 
@@ -639,6 +644,11 @@ def cmd_selftest(args) -> int:
         crit = build_criteria(work, None)
         assert crit["Invoices"]["files_already_in_it"] == ["inv_001.pdf"]
         assert STAY in crit and len(crit) == 3
+        # a folder holding only subfolders must not be called "empty"
+        (work / "Archive" / "2024").mkdir(parents=True)
+        crit = build_criteria(work, None)
+        assert crit["Archive"]["subfolders_it_contains"] == ["2024"], crit["Archive"]
+        assert "empty" not in json.dumps(crit["Archive"])
 
         # --- .jevsorter.json overrides the folder listing -------------------
         (work / CONFIG_NAME).write_text(json.dumps(

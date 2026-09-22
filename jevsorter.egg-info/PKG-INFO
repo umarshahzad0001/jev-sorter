@@ -35,11 +35,19 @@ setx JEV_API_KEY "your-key-here"
 ## Quick start
 
 ```bash
-jevsorter selftest              # assertions, no network, no files touched
-jevsorter propose D:\Downloads  # list filenames so you can write categories
-jevsorter sort D:\Downloads     # DRY RUN - prints decisions, moves nothing
-jevsorter sort D:\Downloads --apply
+cd D:\Downloads
+jevsorter propose    # list filenames so you can write categories
+jevsorter sort       # DRY RUN - prints decisions, moves nothing
+jevsorter sort --apply
 jevsorter undo last
+```
+
+`propose` and `sort` default to the directory you're standing in. Name folders
+explicitly when you want others, and `sort` takes as many as you like:
+
+```bash
+jevsorter sort D:\Downloads D:\Documents D:\Study
+jevsorter selftest   # assertions, no network, no files touched
 ```
 
 ## How it decides
