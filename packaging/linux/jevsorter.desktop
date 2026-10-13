@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Jev Sorter
+Comment=Sort loose files into folders with Jev
+Exec=@EXEC@ %f
+Icon=jevsorter
+Terminal=false
+Categories=Utility;FileTools;
+StartupWMClass=JevSorter

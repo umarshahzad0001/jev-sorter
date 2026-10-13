@@ -18,11 +18,13 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +32,11 @@ API_URL = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-latest"
 KEY_ENV = "JEV_API_KEY"
 PRICE_PER_M_INPUT = 0.042  # USD; output tokens are free
+
+
+class JevError(Exception):
+    """A problem the user must fix (bad key, bad config). Raised instead of
+    SystemExit so GUI worker threads do not die silently; main() prints it."""
 
 
 def summarize_usage(usage_sink: list) -> tuple[int, int, float]:
@@ -76,12 +83,38 @@ SKIP_NAMES = {"desktop.ini", "thumbs.db", ".ds_store", CONFIG_NAME.lower()}
 # log
 # --------------------------------------------------------------------------
 
+def app_dir() -> Path:
+    """Where settings and the move log live: the platform's per-user data folder."""
+    override = os.environ.get("JEVSORTER_HOME")
+    if override:
+        return Path(override)
+    home = Path.home()
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = home / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME") or home / ".local" / "share")
+    return base / "jevsorter"
+
+
+def open_path(path: Path) -> None:
+    """Show a folder in the system file manager."""
+    import subprocess
+    if sys.platform == "win32":
+        os.startfile(path)
+    else:
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
+
+
 def log_path() -> Path:
     override = os.environ.get("JEVSORTER_LOG")
     if override:
         return Path(override)
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    return Path(base) / "jevsorter" / "moves.jsonl"
+    legacy = Path.home() / "jevsorter" / "moves.jsonl"  # where 0.1 wrote it on macOS and Linux
+    if sys.platform != "win32" and legacy.exists() and not (app_dir() / "moves.jsonl").exists():
+        return legacy
+    return app_dir() / "moves.jsonl"
 
 
 def append_log(record: dict) -> None:
@@ -184,10 +217,10 @@ def load_config(folder: Path) -> dict[str, str] | None:
     try:
         data = json.loads(cfg.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        raise SystemExit(f"{cfg}: cannot read categories file: {exc}")
+        raise JevError(f"{cfg}: cannot read categories file: {exc}")
     cats = data.get("categories")
     if not isinstance(cats, dict) or not cats:
-        raise SystemExit(f"{cfg}: expected a non-empty 'categories' object")
+        raise JevError(f"{cfg}: expected a non-empty 'categories' object")
     return {str(k): str(v) for k, v in cats.items()}
 
 
@@ -241,7 +274,7 @@ def build_criteria(folder: Path, config: dict[str, str] | None) -> dict:
 def api_key() -> str:
     key = os.environ.get(KEY_ENV)
     if not key:
-        raise SystemExit(
+        raise JevError(
             f"{KEY_ENV} is not set.\n"
             f"Set it as a user environment variable, then open a new terminal:\n"
             f'    setx {KEY_ENV} "your-key-here"'
@@ -249,11 +282,12 @@ def api_key() -> str:
     return key
 
 
-def jev_choice(state: dict, criteria: dict, key: str, timeout: int = 60,
-              usage_sink: list | None = None) -> dict:
+def jev_choice(state: dict, criteria: dict, key: str | None, timeout: int = 60,
+              usage_sink: list | None = None, url: str = API_URL,
+              model: str = MODEL) -> dict:
     payload = {
         "state": state,
-        "model": MODEL,
+        "model": model,
         "questions": {
             "folder": {
                 "type": "choice",
@@ -268,15 +302,10 @@ def jev_choice(state: dict, criteria: dict, key: str, timeout: int = 60,
         },
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        API_URL,
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        },
-    )
+    headers = {"Content-Type": "application/json"}
+    if key:  # a local server may not need one
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
 
     delay = 1.0
     for attempt in range(3):
@@ -288,7 +317,7 @@ def jev_choice(state: dict, criteria: dict, key: str, timeout: int = 60,
             return data["answers"]["folder"]
         except urllib.error.HTTPError as exc:
             if exc.code == 401:
-                raise SystemExit(f"401 from TypeSafe: {KEY_ENV} is not a valid key.")
+                raise JevError("401 Unauthorized: the API key was rejected.")
             if exc.code in (429, 529) and attempt < 2:
                 time.sleep(delay)
                 delay *= 4
@@ -372,29 +401,52 @@ def decide_target(dec: Decision, current: str | None, args) -> str | None:
     return dec.choice
 
 
-def sort_folder(folder: Path, args, key: str, run_id: str,
-                classify=None, already_moved: set | None = None,
-                usage_sink: list | None = None) -> tuple[int, int]:
-    """Sort one folder's loose files (and, with --resort, its filed files)."""
-    already_moved = already_moved if already_moved is not None else set()
-    classify = classify or (
-        lambda state, criteria: jev_choice(state, criteria, key, usage_sink=usage_sink)
-    )
+@dataclass
+class Proposal:
+    """One file's verdict. target is None when the file stays put."""
+    folder: Path            # the folder whose categories were used
+    path: Path
+    current: str | None     # subfolder it already sits in (--resort), else None
+    choice: str = ""
+    confidence: float = 0.0
+    probabilities: dict = field(default_factory=dict)
+    target: str | None = None
+    error: str | None = None
 
+
+@dataclass
+class FolderPlan:
+    folder: Path
+    proposals: list = field(default_factory=list)
+    categories: list = field(default_factory=list)  # destination names
+    status: str = ""        # why the folder was skipped, else ""
+
+
+def plan_folder(folder: Path, args, key: str | None, classify=None,
+                usage_sink: list | None = None, skip: set | None = None,
+                progress=None, cancel: threading.Event | None = None,
+                url: str = API_URL, model: str = MODEL) -> FolderPlan:
+    """Ask Jev about one folder's files. Moves nothing."""
+    skip = skip if skip is not None else set()
+    classify = classify or (
+        lambda state, criteria: jev_choice(state, criteria, key, url=url,
+                                           model=model, usage_sink=usage_sink)
+    )
+    plan = FolderPlan(folder)
     config = load_config(folder)
     subs = subfolders(folder)
     criteria = build_criteria(folder, config)
 
-    n_options = len(criteria) - 1  # STAY does not count as a destination
+    plan.categories = [k for k in criteria if k != STAY]
+    n_options = len(plan.categories)
     if n_options == 0:
-        print(f"  {folder}: no categories (no subfolders, no {CONFIG_NAME}) - skipped")
-        return (0, 0)
+        plan.status = f"no categories (no subfolders, no {CONFIG_NAME})"
+        return plan
     if n_options > MAX_OPTIONS - 1:
-        print(f"  {folder}: {n_options} categories exceeds the {MAX_OPTIONS}-option "
-              f"limit - SKIPPED (shortlisting would hide why files stayed put)")
-        return (0, 0)
+        plan.status = (f"{n_options} categories exceeds the {MAX_OPTIONS}-option "
+                       f"limit - refused (shortlisting would hide why files stayed put)")
+        return plan
 
-    # (path, current_folder_name_or_None)
     targets: list[tuple[Path, str | None]] = [
         (p, None) for p in loose_files(folder, args.min_age)
     ]
@@ -402,67 +454,121 @@ def sort_folder(folder: Path, args, key: str, run_id: str,
         for sub in subs:
             for p in loose_files(sub, args.min_age):
                 targets.append((p, sub.name))
-
-    targets = [(p, c) for p, c in targets if p not in already_moved]
-    if not targets:
-        return (0, 0)
-
-    print(f"  {folder}  ({len(targets)} files, {n_options} categories)")
+    targets = [(p, c) for p, c in targets if p not in skip]
 
     def work(item):
         path, current = item
+        prop = Proposal(folder, path, current)
+        if cancel is not None and cancel.is_set():
+            prop.error = "cancelled"
+            return prop
         try:
             ans = classify(file_state(path, current), criteria)
+            prop.choice = ans["choice"]
+            prop.confidence = float(ans.get("confidence", 0.0))
+            prop.probabilities = ans.get("probabilities", {})
+            prop.target = decide_target(
+                Decision(path, prop.choice, prop.confidence, prop.probabilities),
+                current, args)
+        except JevError:
+            raise  # bad key etc.: every file would fail the same way
         except Exception as exc:  # one bad file must not end the run
-            return item, None, str(exc)
-        return item, Decision(
-            path, ans["choice"], float(ans.get("confidence", 0.0)),
-            ans.get("probabilities", {}),
-        ), None
+            prop.error = str(exc)
+        return prop
 
+    done = 0
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        results = list(pool.map(work, targets))
+        futures = [pool.submit(work, t) for t in targets]
+        try:
+            for fut in as_completed(futures):
+                plan.proposals.append(fut.result())
+                done += 1
+                if progress:
+                    progress(done, len(targets))
+        except BaseException:
+            for f in futures:
+                f.cancel()
+            raise
+    plan.proposals.sort(key=lambda r: (str(r.path.parent), r.path.name.lower()))
+    return plan
 
-    moved = considered = 0
-    for (path, current), dec, err in results:
-        considered += 1
-        if err is not None:
-            print(f"    {path.name}  -> ERROR: {err}")
+
+@dataclass
+class MoveResult:
+    proposal: Proposal
+    dst: Path | None = None
+    error: str | None = None
+
+
+def apply_moves(proposals, run_id: str, min_age: int = 0,
+                model: str = MODEL) -> list[MoveResult]:
+    """Move approved proposals and log each. Re-checks every file first: a
+    preview can be minutes old and the file may be growing or gone by now."""
+    results = []
+    for prop in proposals:
+        res = MoveResult(prop)
+        results.append(res)
+        if not prop.target:
             continue
+        why = (skippable_file(prop.path, min_age) if prop.path.exists()
+               else "file no longer exists")
+        if why:
+            res.error = f"skipped: {why}"
+            continue
+        try:
+            res.dst = move(prop.path, prop.folder / prop.target / prop.path.name)
+        except OSError as exc:
+            res.error = f"could not move (in use?): {exc}"
+            continue
+        append_log({
+            "run_id": run_id,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "src": str(prop.path),
+            "dst": str(res.dst),
+            "choice": prop.choice,
+            "confidence": prop.confidence,
+            "top_probabilities": dict(sorted(
+                prop.probabilities.items(), key=lambda kv: -kv[1])[:3]),
+            "model": model,
+            "dry_run": False,
+        })
+    return results
 
-        target = decide_target(dec, current, args)
-        label = target or "STAY"
-        print(f"    {path.name}  ->  {label}  (conf {dec.confidence:.2f})")
 
-        if target is None:
+def sort_folder(folder: Path, args, key: str, run_id: str,
+                classify=None, already_moved: set | None = None,
+                usage_sink: list | None = None, url: str = API_URL,
+                model: str = MODEL) -> tuple[int, int]:
+    """CLI path: plan one folder, print verdicts, move them under --apply."""
+    already_moved = already_moved if already_moved is not None else set()
+    plan = plan_folder(folder, args, key, classify=classify, usage_sink=usage_sink,
+                       skip=already_moved, url=url, model=model)
+    if plan.status:
+        print(f"  {folder}: {plan.status} - skipped")
+        return (0, 0)
+    if not plan.proposals:
+        return (0, 0)
+    print(f"  {folder}  ({len(plan.proposals)} files, {len(plan.categories)} categories)")
+
+    moved = 0
+    for prop in plan.proposals:
+        if prop.error:
+            print(f"    {prop.path.name}  -> ERROR: {prop.error}")
+            continue
+        print(f"    {prop.path.name}  ->  {prop.target or 'STAY'}  "
+              f"(conf {prop.confidence:.2f})")
+        if not prop.target:
             continue
         if not args.apply:
             moved += 1
             continue
-
-        dst = folder / target / path.name
-        try:
-            actual = move(path, dst)
-        except OSError as exc:
-            print(f"      could not move (in use?): {exc}")
+        res = apply_moves([prop], run_id, model=model)[0]
+        if res.error:
+            print(f"      {res.error}")
             continue
-
-        already_moved.add(actual)
+        already_moved.add(res.dst)
         moved += 1
-        append_log({
-            "run_id": run_id,
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "src": str(path),
-            "dst": str(actual),
-            "choice": dec.choice,
-            "confidence": dec.confidence,
-            "top_probabilities": dict(sorted(
-                dec.probabilities.items(), key=lambda kv: -kv[1])[:3]),
-            "model": MODEL,
-            "dry_run": False,
-        })
-
-    return (moved, considered)
+    return (moved, len(plan.proposals))
 
 
 # --------------------------------------------------------------------------
@@ -559,36 +665,53 @@ def cmd_sort(args) -> int:
         time.sleep(args.every * 60)
 
 
-def cmd_undo(args) -> int:
-    records = [r for r in read_log() if not r.get("dry_run")]
-    if not records:
-        print("Nothing to undo.")
-        return 0
+def list_runs() -> list[dict]:
+    """Past runs, newest first: {run_id, ts, count}."""
+    runs: dict[str, dict] = {}
+    for r in read_log():
+        if r.get("dry_run"):
+            continue
+        run = runs.setdefault(r["run_id"], {"run_id": r["run_id"], "ts": r.get("ts", ""), "count": 0})
+        run["count"] += 1
+    return list(reversed(list(runs.values())))
 
-    run_id = records[-1]["run_id"] if args.run == "last" else args.run
-    batch = [r for r in records if r.get("run_id") == run_id]
+
+def undo_run(run_id: str) -> tuple[int, list[str]]:
+    """Reverse one run. Returns (restored, per-file messages)."""
+    batch = [r for r in read_log() if not r.get("dry_run") and r.get("run_id") == run_id]
     if not batch:
-        raise SystemExit(f"no run {run_id!r} in {log_path()}")
-
-    print(f"Undoing run {run_id} ({len(batch)} moves)")
-    restored = 0
+        raise JevError(f"no run {run_id!r} in {log_path()}")
+    restored, lines = 0, []
     for rec in reversed(batch):
         src, dst = Path(rec["src"]), Path(rec["dst"])
         if not dst.exists():
-            print(f"  skip (gone):     {dst}")
+            lines.append(f"skip (gone):     {dst}")
             continue
         if src.exists():
-            print(f"  skip (occupied): {src}")
+            lines.append(f"skip (occupied): {src}")
             continue
         try:
             src.parent.mkdir(parents=True, exist_ok=True)
             os.rename(dst, src)
             restored += 1
-            print(f"  {dst.name}  ->  {src.parent}")
+            lines.append(f"{dst.name}  ->  {src.parent}")
         except OSError as exc:
-            print(f"  FAILED {dst}: {exc}")
+            lines.append(f"FAILED {dst}: {exc}")
+    return restored, lines
 
-    print(f"\nrestored {restored} of {len(batch)} files.")
+
+def cmd_undo(args) -> int:
+    runs = list_runs()
+    if not runs:
+        print("Nothing to undo.")
+        return 0
+    run_id = runs[0]["run_id"] if args.run == "last" else args.run
+    n = next((r["count"] for r in runs if r["run_id"] == run_id), 0)
+    print(f"Undoing run {run_id} ({n} moves)")
+    restored, lines = undo_run(run_id)
+    for line in lines:
+        print(f"  {line}")
+    print(f"\nrestored {restored} of {n} files.")
     return 0
 
 
@@ -731,6 +854,27 @@ def cmd_selftest(args) -> int:
         # --- bare 'sort' / 'propose' mean the current directory -----------
         # This one guards a destructive default: if it ever regressed to
         # something other than cwd, --apply would move the wrong files.
+        # --- per-user data folder follows each platform's convention ---------
+        kept = {k: os.environ.pop(k, None) for k in ("JEVSORTER_HOME", "JEVSORTER_LOG", "XDG_DATA_HOME", "LOCALAPPDATA")}
+        real_platform = sys.platform
+        try:
+            sys.platform = "darwin"
+            assert app_dir() == Path.home() / "Library" / "Application Support" / "jevsorter"
+            sys.platform = "linux"
+            assert app_dir() == Path.home() / ".local" / "share" / "jevsorter"
+            os.environ["XDG_DATA_HOME"] = "/x"
+            assert app_dir() == Path("/x") / "jevsorter"
+            sys.platform = "win32"
+            os.environ["LOCALAPPDATA"] = "C:/L"
+            assert app_dir() == Path("C:/L") / "jevsorter"
+            os.environ["JEVSORTER_HOME"] = "/h"
+            assert app_dir() == Path("/h"), "JEVSORTER_HOME must win everywhere"
+        finally:
+            sys.platform = real_platform
+            for k in kept:
+                os.environ.pop(k, None)
+            os.environ.update({k: v for k, v in kept.items() if v is not None})
+
         parser = build_parser()
         assert parser.parse_args(["sort"]).dirs == ["."]
         assert parser.parse_args(["sort", "X", "Y"]).dirs == ["X", "Y"]
@@ -788,6 +932,9 @@ def main(argv=None) -> int:
     # script behaves the same as running the file directly.
     try:
         return args.func(args)
+    except JevError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         print("\ninterrupted")
         return 130

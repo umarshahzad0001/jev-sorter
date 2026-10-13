@@ -1,18 +1,27 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "jevsorter"
-version = "0.1.0"
+version = "1.0.0"
 description = "Sort loose files into a folder's own subfolders, using Jev to judge where each one belongs."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+authors = [{name = "Umar Shahzad"}]
 requires-python = ">=3.9"
 dependencies = []
 keywords = ["files", "sorting", "jev", "typesafe", "cli"]
 
+[project.optional-dependencies]
+gui = ["customtkinter>=5", "pillow", "pystray"]
+
 [project.scripts]
 jevsorter = "jevsorter:main"
 
+[project.gui-scripts]
+jevsorter-gui = "jevsorter_gui:main"
+
 [tool.setuptools]
-py-modules = ["jevsorter"]
+py-modules = ["jevsorter", "jevsorter_settings", "jevsorter_theme", "jevsorter_tray", "jevsorter_dialogs", "jevsorter_presets", "jevsorter_gui"]
